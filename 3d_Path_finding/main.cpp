@@ -64,6 +64,11 @@ struct Example : cmn::Engine3D {
 	float pi_angle = Pi / 180.0f;
 	float counter = 0;
 
+	bool walking = false;
+	const float time_per_seg = 1.3f;
+	float seg_timer = 0;
+	int seg_ix = 0;
+
 	bool user_create() override {
 		cam_pos={0, 7, 0};
 		light_pos={0, 45, 0};
@@ -268,12 +273,7 @@ struct Example : cmn::Engine3D {
 					route=graph.route(from_node, to_node);
 				} else route.clear();
 			}
-			//if (from_node)
-			//{
-			//	std::cout << "from_node_pos.x: " << from_node->pos.x << std::endl;
-			//	std::cout << "from_node_pos.y: " << from_node->pos.y << std::endl;
-			//	std::cout << "from_node_pos.z: " << from_node->pos.z << std::endl;
-			//}
+			
 
 			//set to waypoint
 			if(GetKey(olc::Key::T).bHeld) {
@@ -288,20 +288,51 @@ struct Example : cmn::Engine3D {
 		if(GetKey(olc::Key::TAB).bPressed) {
 			std::swap(to_node, from_node);
 			route.clear();
+			walking = false;
 		}
 
 		//remove waypoints
 		if(GetKey(olc::Key::ESCAPE).bPressed) {
 			from_node=nullptr, to_node=nullptr;
 			route.clear();
+			walking = false;
 		}
 
 		//route
 		if(GetKey(olc::Key::ENTER).bPressed) {
 			route=graph.route(from_node, to_node);
+			walking = false;
 		}
 
 		anim_timer+=dt;
+
+		//walk
+		if (GetKey(olc::Key::R).bPressed)
+		{
+			walking = false;
+
+			//only if walkable
+			if (route.size() >= 2)
+			{
+				walking = true;
+				seg_ix = 0;
+				seg_timer = 0;
+			}
+		}
+
+		//walk update
+		if (walking)
+		{
+			seg_timer += dt;
+			
+			if (seg_timer > time_per_seg)
+			{
+				seg_timer = 0;
+
+				seg_ix++;
+				if (seg_ix == route.size() - 1) walking = false;
+			}
+		}
 
 		//update animations
 		for (auto& b : billboards) {
