@@ -1,0 +1,537 @@
+#include "engine_3d.h"
+using cmn::vf3d;
+using cmn::Mat4;
+
+constexpr float Pi=3.1415927f;
+
+#include "mesh.h"
+
+#include "aabb.h"
+#include "utils.h"
+#include "billboard.h"
+#include "packing.h"
+#include "sprite_sheet.h"
+namespace cmn {
+	using AABB=AABB_generic<olc::vf2d>;
+
+	olc::vf2d polar(float rad, float angle) {
+		return polar_generic<olc::vf2d>(rad, angle);
+	}
+}
+
+#include "poisson_disc.h"
+
+#include "triangulate.h"
+
+#include <unordered_map>
+
+#include "graph.h"
+
+float fract(float x) {
+	return x-std::floor(x);
+}
+
+struct Example : cmn::Engine3D {
+	Example() {
+		sAppName="A* Navigation";
+	}
+
+	//camera positioning
+	float cam_yaw=Pi/2;
+	float cam_pitch=0;
+
+	//ui stuff
+	vf3d mouse_dir;
+	bool show_graph=true;
+
+	//scene stuff
+	Mesh terrain;
+	std::list<Mesh> obstacles;
+
+	Graph graph;
+
+	//route markers
+	Node* from_node=nullptr, * to_node=nullptr;
+	std::list<Node*> route;
+
+	//route fanciness
+	std::vector<olc::Sprite*> texture_atlas;
+	float anim_timer=0;
+
+	std::string current_anim;
+	std::vector<SpriteSheet*> sprite_sheet_atlas;
+	std::list<Billboard> billboards;
+	float pi_angle = Pi / 180.0f;
+	float counter = 0;
+
+	bool user_create() override {
+		cam_pos={0, 7, 0};
+		light_pos={0, 45, 0};
+		from_node = new Node({ 1.90214,0.556576,17.2319 });
+		//load terrain & homes
+		try {
+			//color terrain based on slope
+			terrain=Mesh::loadFromOBJ("models/terrain.txt");
+			olc::Sprite* gradient_spr=new olc::Sprite("img/grass_falloff.png");
+			const vf3d up(0, 1, 0);
+			for(auto& t:terrain.tris) {
+				//get steepness
+				float s=up.cross(t.getNorm()).mag();
+				t.col=gradient_spr->Sample(s, 0);
+			}
+			delete gradient_spr;
+			
+			//house placement
+			Mesh house_model=Mesh::loadFromOBJ("models/house.txt");
+			house_model.scale={1.5f, 1.5f, 1.5f};
+			struct House { vf3d p; float r; olc::Pixel col; };
+			std::vector<House> homes{
+				{{3.54f, 1.37f, 18.2f}, .8f*Pi, olc::BLACK},
+				{{5.64f, 2.86f, 51.79f}, 1.4f*Pi, olc::BLUE},
+				{{51.31f, 1.67f, 41.95f}, .2f*Pi, olc::WHITE},
+				{{62.04f, 1.67f, -5.12f}, .6f*Pi, olc::RED},
+				{{12.09f, 2.16f, -38.03f}, 1.1f*Pi, olc::WHITE},
+				{{-38.35f, 2.63f, -33.38f}, .3f*Pi, olc::GREEN},
+				{{-52.99f, 1.43f, 16.84f}, 1.8f*Pi, olc::WHITE}
+			};
+			for(const auto& h:homes) {
+				house_model.translation=h.p;
+				house_model.rotation.y=h.r;
+				house_model.updateTransforms();
+				house_model.updateTriangles(h.col);
+				obstacles.push_back(house_model);
+			}
+
+			//making actual spritesheet
+			SpriteSheet* four_ways = new SpriteSheet("assets/trooper_anim_idle.png", 7, 4);
+			four_ways->animations["left"] = { 0, 1, 2, 3, 4, 5, 6 };
+			four_ways->animations["right"] = { 7, 8, 9, 10, 11, 12,13 };
+			four_ways->animations["forward"] = { 14, 15, 16, 17 ,18,19,20 };
+			four_ways->animations["backward"] = { 21, 22, 23,24,25,26,27 };
+			sprite_sheet_atlas.push_back(four_ways);
+
+			billboards.push_back({ {10.0f, 1.37f, 17.2f}, pack(0, 0, 0, 0), "forward" });
+			billboards.push_back({ {10.0f, 1.37f, 17.2f}, pack(0, 0, 0, 0), "backward" });
+			billboards.push_back({ {10.0f, 1.37f, 17.2f}, pack(0, 0, 0, 0), "left" });
+			billboards.push_back({ {10.0f, 1.37f, 17.2f}, pack(0, 0, 0, 0), "right" });
+
+
+		} catch(const std::exception& e) {
+			std::cout<<"  "<<e.what()<<'\n';
+			return false;
+		}
+
+		//randomly sample points on xz plane
+		cmn::AABB3 bounds=terrain.getAABB();
+		auto xz_pts=poissonDiscSample({{bounds.min.x, bounds.min.z}, {bounds.max.x, bounds.max.z}}, 2);
+
+		//project pts onto terrain
+		std::unordered_map<olc::vf2d*, Node*> xz2way;
+		for(auto& p:xz_pts) {
+			vf3d orig(p.x, bounds.min.y-.1f, p.y);
+			vf3d dir(0, 1, 0);
+			float dist=terrain.intersectRay(orig, dir);
+			graph.nodes.push_back(new Node(orig+(.2f+dist)*dir));
+			xz2way[&p]=graph.nodes.back();
+		}
+
+		//triangulate and add links
+		auto tris=delaunay::triangulate(xz_pts);
+		auto edges=delaunay::extractEdges(tris);
+		for(const auto& e:edges) {
+			auto a=xz2way[&xz_pts[e.p[0]]];
+			auto b=xz2way[&xz_pts[e.p[1]]];
+			graph.addLink(a, b);
+			graph.addLink(b, a);
+		}
+
+		//remove any nodes in way of obstacle
+		for(auto it=graph.nodes.begin(); it!=graph.nodes.end();) {
+			auto& n=*it;
+			//check if inside any meshes
+			bool blocked=false;
+			for(const auto& o:obstacles) {
+				if(o.contains(n->pos)) {
+					blocked=true;
+					break;
+				}
+			}
+			if(blocked) {
+				//remove corresponding links
+				for(auto& o:graph.nodes) {
+					auto oit=std::find(o->links.begin(), o->links.end(), n);
+					if(oit!=o->links.end()) o->links.erase(oit);
+				}
+				//deallocate and remove this node
+				delete n;
+				it=graph.nodes.erase(it);
+			} else it++;
+		}
+
+		//load route marker textures
+		texture_atlas.push_back(new olc::Sprite("start.png"));
+		texture_atlas.push_back(new olc::Sprite("end.png"));
+
+		return true;
+	}
+
+	bool user_destroy() override {
+		for(auto& t:texture_atlas) delete t;
+		for (auto& s : sprite_sheet_atlas) delete s;
+
+		return true;
+	}
+
+	bool user_update(float dt) override {
+		//look up, down
+		if(GetKey(olc::Key::UP).bHeld) cam_pitch+=dt;
+		if(cam_pitch>Pi/2) cam_pitch=Pi/2-.001f;
+		if(GetKey(olc::Key::DOWN).bHeld) cam_pitch-=dt;
+		if(cam_pitch<-Pi/2) cam_pitch=.001f-Pi/2;
+
+		//look left, right
+		if(GetKey(olc::Key::LEFT).bHeld) cam_yaw-=dt;
+		if(GetKey(olc::Key::RIGHT).bHeld) cam_yaw+=dt;
+
+		//polar to cartesian
+		cam_dir=vf3d(
+			std::cos(cam_yaw)*std::cos(cam_pitch),
+			std::sin(cam_pitch),
+			std::sin(cam_yaw)*std::cos(cam_pitch)
+		);
+
+		//speed modifier
+		float speed=dt;
+		if(GetKey(olc::Key::CTRL).bHeld) speed*=3;
+
+		//move up, down
+		if(GetKey(olc::Key::SPACE).bHeld) cam_pos.y+=4.f*speed;
+		if(GetKey(olc::Key::SHIFT).bHeld) cam_pos.y-=4.f*speed;
+
+		//move forward, backward
+		vf3d fb_dir(std::cos(cam_yaw), 0, std::sin(cam_yaw));
+		if(GetKey(olc::Key::W).bHeld) cam_pos+=5.f*speed*fb_dir;
+		if(GetKey(olc::Key::S).bHeld) cam_pos-=3.f*speed*fb_dir;
+
+		//move left, right
+		vf3d lr_dir(fb_dir.z, 0, -fb_dir.x);
+		if(GetKey(olc::Key::A).bHeld) cam_pos+=4.f*speed*lr_dir;
+		if(GetKey(olc::Key::D).bHeld) cam_pos-=4.f*speed*lr_dir;
+
+		//set light pos
+		if(GetKey(olc::Key::L).bHeld) light_pos=cam_pos;
+
+		//graphics toggles
+		if(GetKey(olc::Key::G).bPressed) show_graph^=true;
+
+		if(GetKey(olc::Key::N).bPressed) {
+			std::cout<<cam_pos.x<<' '<<cam_pos.y<<' '<<cam_pos.z<<'\n';
+		}
+
+		//update mouse ray(matrix could be singular)
+		try {
+			//unprojection matrix
+			cmn::Mat4 inv_vp=cmn::Mat4::inverse(mat_view*mat_proj);
+
+			//get ray thru screen mouse pos
+			float ndc_x=1-2.f*GetMouseX()/ScreenWidth();
+			float ndc_y=1-2.f*GetMouseY()/ScreenHeight();
+			vf3d clip(ndc_x, ndc_y, 1);
+			vf3d world=clip*inv_vp;
+			world/=world.w;
+			mouse_dir=(world-cam_pos).norm();
+		} catch(const std::exception& e) {}
+
+		//find node "under" mouse
+		float record=-1;
+		Node* close_node=nullptr;
+		for(auto& n:graph.nodes) {
+			vf3d pa=n->pos-cam_pos;
+			//infront of camera.
+			if(pa.dot(mouse_dir)>0) {
+				//sort by perp dist from ray
+				float dist=pa.cross(mouse_dir).mag();
+				if(record<0||dist<record) {
+					record=dist;
+					close_node=n;
+				}
+			}
+		}
+
+		
+		
+		if(close_node) {
+			//set from waypoint
+			if(GetKey(olc::Key::F).bHeld) {
+				from_node=close_node;
+				if(GetKey(olc::Key::CTRL).bHeld) {
+					route=graph.route(from_node, to_node);
+				} else route.clear();
+			}
+			//if (from_node)
+			//{
+			//	std::cout << "from_node_pos.x: " << from_node->pos.x << std::endl;
+			//	std::cout << "from_node_pos.y: " << from_node->pos.y << std::endl;
+			//	std::cout << "from_node_pos.z: " << from_node->pos.z << std::endl;
+			//}
+
+			//set to waypoint
+			if(GetKey(olc::Key::T).bHeld) {
+				to_node=close_node;
+				if(GetKey(olc::Key::CTRL).bHeld) {
+					route=graph.route(from_node, to_node);
+				} else route.clear();
+			}
+		}
+
+		//swap waypoints
+		if(GetKey(olc::Key::TAB).bPressed) {
+			std::swap(to_node, from_node);
+			route.clear();
+		}
+
+		//remove waypoints
+		if(GetKey(olc::Key::ESCAPE).bPressed) {
+			from_node=nullptr, to_node=nullptr;
+			route.clear();
+		}
+
+		//route
+		if(GetKey(olc::Key::ENTER).bPressed) {
+			route=graph.route(from_node, to_node);
+		}
+
+		anim_timer+=dt;
+
+		//update animations
+		for (auto& b : billboards) {
+			b.update(dt);
+		}
+
+		return true;
+	}
+
+
+
+
+	void makeQuad(vf3d p, float w, float h, float ax, float ay, cmn::Triangle& a, cmn::Triangle& b) {
+		//billboarded to point at camera
+		vf3d norm=(p-cam_pos).norm();
+		vf3d up(0, 1, 0);
+		vf3d rgt=norm.cross(up).norm();
+		up=rgt.cross(norm);
+
+		//vertex positioning
+		vf3d tl=p-w*ax*rgt+h*ay*up;
+		vf3d tr=p+w*(1-ax)*rgt+h*ay*up;
+		vf3d bl=p-w*ax*rgt-h*(1-ay)*up;
+		vf3d br=p+w*(1-ax)*rgt-h*(1-ay)*up;
+
+		//texture coords
+		cmn::v2d tl_t{0, 0};
+		cmn::v2d tr_t{1, 0};
+		cmn::v2d bl_t{0, 1};
+		cmn::v2d br_t{1, 1};
+
+		//tessellation
+		a={tl, br, tr, tl_t, br_t, tr_t};
+		b={tl, bl, br, tl_t, bl_t, br_t};
+	}
+
+	bool user_geometry() override {
+		//add terrain mesh
+		tris_to_project.insert(tris_to_project.end(), terrain.tris.begin(), terrain.tris.end());
+
+		//add obstacles
+		for(const auto& o:obstacles) {
+			tris_to_project.insert(tris_to_project.end(), o.tris.begin(), o.tris.end());
+		}
+
+		if(show_graph) {
+			//add links as black lines
+			for(const auto& n:graph.nodes) {
+				for(const auto& o:n->links) {
+					cmn::Line l1{n->pos, o->pos}; l1.col=olc::BLACK;
+					lines_to_project.push_back(l1);
+				}
+			}
+		}
+
+		//add nodes as billboards
+		for(const auto& n:graph.nodes) {
+			//default size, anchor, and id values
+			float sz=.4f, ay=.5f;
+			int id=-1;
+		
+			//change if route marker.
+			if(n==from_node) sz*=3, ay=1, id=0;
+			else if(n==to_node) sz*=3, ay=1, id=1;
+			else if(!show_graph) continue;
+		
+			//tessellate
+			cmn::Triangle t1, t2;
+			makeQuad(n->pos, sz, sz, .5f, ay, t1, t2);
+		
+			//add
+			t1.id=id, t2.id=id;
+			tris_to_project.push_back(t1);
+			tris_to_project.push_back(t2);
+		}
+		//
+		//place yellow quads along route
+		{
+			bool is_first=true;
+			vf3d prev;
+			//silly little walk animation
+			float anim=fract(anim_timer);
+			for(const auto& r:route) {
+				vf3d curr=r->pos;
+				if(is_first) is_first=false;
+				else {
+					const int num=2;
+					vf3d ba=curr-prev;
+					for(int i=0; i<num; i++) {
+						//interpolate between route pts
+						float t=(anim+i)/num;
+						vf3d pt=prev+t*ba;
+		
+						cmn::Triangle t1, t2;
+						makeQuad(pt, .3f, .3f, .5f, .5f, t1, t2);
+						t1.col=olc::YELLOW, t2.col=olc::YELLOW;
+						tris_to_project.push_back(t1);
+						tris_to_project.push_back(t2);
+					}
+				}
+				prev=curr;
+			}
+		}
+
+
+		//sort billboards by cam dist for transperancy
+		billboards.sort([&](const Billboard& a, const Billboard& b) {
+			return (a.pos - cam_pos).mag2() > (b.pos - cam_pos).mag2();
+			});
+
+		//add billboards
+		for (const auto& b : billboards) {
+			//get basis vectors
+			vf3d norm = (b.pos - cam_pos).norm();
+			vf3d up(0, 1, 0);
+			vf3d rgt = norm.cross(up).norm();
+			up = rgt.cross(norm);
+
+			//rotate basis vectors w/ rotation matrix
+			float c = std::cos(b.rot), s = std::sin(b.rot);
+			vf3d new_rgt = c * rgt + s * up;
+			vf3d new_up = -s * rgt + c * up;
+
+			//vertex positioning
+			vf3d tl = b.pos + b.w / 2 * new_rgt + b.h / 2 * new_up;
+			vf3d tr = b.pos + b.w / 2 * new_rgt - b.h / 2 * new_up;
+			vf3d bl = b.pos - b.w / 2 * new_rgt + b.h / 2 * new_up;
+			vf3d br = b.pos - b.w / 2 * new_rgt - b.h / 2 * new_up;
+
+			//unpack sprite sheet index
+			unsigned char ss_idx, _na;
+			unpack(b.id, _na, ss_idx, _na, _na);
+
+			//get corresponding sprite sheet
+			SpriteSheet& ss = *sprite_sheet_atlas[ss_idx];
+			//get texture rect
+			olc::vf2d min_uv, max_uv;
+
+			olc::vf2d p = { cam_pos.x, cam_pos.z };
+			olc::vf2d bill = { b.pos.x, b.pos.z };
+
+			olc::vf2d dist = bill - p;
+
+			float angle = atan2f(dist.y, dist.x);
+
+
+			if (angle < (45 * pi_angle) || angle > -(45 * pi_angle)) current_anim = "right"; // right
+			if (angle < (135 * pi_angle) && angle >(45 * pi_angle)) current_anim = "backward"; // back
+			if (angle < -(135 * pi_angle) || angle >(135 * pi_angle)) current_anim = "left"; //left
+			if (angle < -(45 * pi_angle) && angle > -(135 * pi_angle)) current_anim = "forward";
+
+			if (b.state == current_anim)
+			{
+				ss.getCurrRect(b.state, b.anim, min_uv, max_uv);
+
+				//texture coords
+				cmn::v2d tl_t{ max_uv.x, min_uv.y };
+				cmn::v2d tr_t{ max_uv.x, max_uv.y };
+				cmn::v2d bl_t{ min_uv.x, min_uv.y };
+				cmn::v2d br_t{ min_uv.x, max_uv.y };
+
+				//tessellate vertexes w/ texture coords & pass packed id
+				cmn::Triangle f1{ tl, br, tr, tl_t, br_t, tr_t }; f1.id = b.id;
+				tris_to_project.push_back(f1);
+				cmn::Triangle f2{ tl, bl, br, tl_t, bl_t, br_t }; f2.id = b.id;
+				tris_to_project.push_back(f2);
+			}
+		}
+
+
+		return true;
+	}
+
+	bool user_render() override {
+		Clear(olc::Pixel(60, 60, 60));
+
+		//render 3d stuff
+		resetBuffers();
+
+		for(const auto& t:tris_to_draw) {
+			if(t.id==-1) {
+				FillDepthTriangle(
+					t.p[0].x, t.p[0].y, t.t[0].w,
+					t.p[1].x, t.p[1].y, t.t[1].w,
+					t.p[2].x, t.p[2].y, t.t[2].w,
+					t.col, t.id
+				);
+			} else {
+				SetPixelMode(olc::Pixel::Mode::ALPHA);
+
+				//billboard sprite rendering
+				unsigned char id, ss_idx, _na;
+				unpack(t.id, id, ss_idx, _na, _na);
+				//texture with corresponding sprite lookup
+				FillTexturedDepthTriangle(
+					t.p[0].x, t.p[0].y, t.t[0].u, t.t[0].v, t.t[0].w,
+					t.p[1].x, t.p[1].y, t.t[1].u, t.t[1].v, t.t[1].w,
+					t.p[2].x, t.p[2].y, t.t[2].u, t.t[2].v, t.t[2].w,
+					sprite_sheet_atlas[ss_idx]->sprite, t.col, id
+				);
+
+
+				FillTexturedDepthTriangle(
+					t.p[0].x, t.p[0].y, t.t[0].u, t.t[0].v, t.t[0].w,
+					t.p[1].x, t.p[1].y, t.t[1].u, t.t[1].v, t.t[1].w,
+					t.p[2].x, t.p[2].y, t.t[2].u, t.t[2].v, t.t[2].w,
+					texture_atlas[t.id], olc::WHITE, t.id
+				);
+
+				
+
+				SetPixelMode(olc::Pixel::Mode::NORMAL);
+			}
+		}
+
+		for(const auto& l:lines_to_draw) {
+			DrawDepthLine(
+				l.p[0].x, l.p[0].y, l.t[0].w,
+				l.p[1].x, l.p[1].y, l.t[1].w,
+				l.col, l.id
+			);
+		}
+
+		return true;
+	}
+};
+
+int main() {
+	Example e;
+	if(e.Construct(800, 600, 1, 1, false, true)) e.Start();
+
+	return 0;
+}
